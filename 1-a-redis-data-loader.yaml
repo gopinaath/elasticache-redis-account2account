@@ -1,0 +1,182 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Simple Lambda function to load test data into existing Redis cluster'
+
+Parameters:
+  RedisEndpoint:
+    Description: Redis cluster endpoint
+    Type: String
+    Default: <redis-cluster-endpoint>
+    
+  VPCId:
+    Description: VPC ID where Redis is deployed
+    Type: String
+    Default: <vpc-id>
+    
+  SubnetIds:
+    Description: Comma-separated list of subnet IDs
+    Type: CommaDelimitedList
+    Default: "<subnet-id-1>,<subnet-id-2>"
+    
+  SecurityGroupId:
+    Description: Security group ID that can access Redis
+    Type: String
+    Default: <security-group-id>
+
+Resources:
+  # Lambda execution role
+  DataLoaderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: CloudFormationRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # Lambda function to load data
+  DataLoaderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: redis-data-loader
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt DataLoaderRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          REDIS_ENDPOINT: !Ref RedisEndpoint
+      Code:
+        ZipFile: |
+          import json
+          import socket
+          import os
+          import time
+          
+          def redis_command(host, port, command):
+              """Send Redis command using raw socket"""
+              try:
+                  sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                  sock.settimeout(10)
+                  sock.connect((host, port))
+                  
+                  # Send command and get response
+                  sock.send(command.encode() + b'\r\n')
+                  response = sock.recv(1024).decode()
+                  sock.close()
+                  return response
+              except Exception as e:
+                  print(f"Redis command failed: {e}")
+                  return None
+          
+          def redis_set(host, port, key, value):
+              """Set key-value using Redis protocol"""
+              cmd = f"*3\r\n$3\r\nSET\r\n${len(key)}\r\n{key}\r\n${len(value)}\r\n{value}\r\n"
+              try:
+                  sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                  sock.settimeout(10)
+                  sock.connect((host, port))
+                  sock.send(cmd.encode())
+                  response = sock.recv(1024).decode()
+                  sock.close()
+                  return "+OK" in response
+              except Exception as e:
+                  print(f"SET {key} failed: {e}")
+                  return False
+          
+          def lambda_handler(event, context):
+              try:
+                  redis_endpoint = os.environ['REDIS_ENDPOINT']
+                  print(f"Connecting to Redis at: {redis_endpoint}")
+                  
+                  # Test connection with PING
+                  ping_response = redis_command(redis_endpoint, 6379, "*1\r\n$4\r\nPING")
+                  if not ping_response or "+PONG" not in ping_response:
+                      return {
+                          'statusCode': 500,
+                          'body': json.dumps(f'Redis connection failed: {ping_response}')
+                      }
+                  
+                  print("Redis connection successful!")
+                  
+                  # Load test data
+                  keys_loaded = 0
+                  
+                  # Load users
+                  print("Loading users...")
+                  for i in range(1, 21):
+                      if redis_set(redis_endpoint, 6379, f"user:{i}", f"User{i}"):
+                          keys_loaded += 1
+                      time.sleep(0.1)  # Small delay to avoid overwhelming
+                  
+                  # Load products
+                  print("Loading products...")
+                  for i in range(1, 21):
+                      if redis_set(redis_endpoint, 6379, f"product:{i}", f"Product{i}"):
+                          keys_loaded += 1
+                      time.sleep(0.1)
+                  
+                  # Load counters
+                  print("Loading counters...")
+                  if redis_set(redis_endpoint, 6379, "global:user_count", "20"):
+                      keys_loaded += 1
+                  if redis_set(redis_endpoint, 6379, "global:product_count", "20"):
+                      keys_loaded += 1
+                  
+                  # Load some sample application data
+                  print("Loading sample app data...")
+                  if redis_set(redis_endpoint, 6379, "app:version", "1.0.0"):
+                      keys_loaded += 1
+                  if redis_set(redis_endpoint, 6379, "app:last_updated", str(int(time.time()))):
+                      keys_loaded += 1
+                  
+                  # Get database size
+                  dbsize_response = redis_command(redis_endpoint, 6379, "*1\r\n$6\r\nDBSIZE")
+                  final_count = 0
+                  if dbsize_response and dbsize_response.startswith(':'):
+                      final_count = int(dbsize_response[1:].strip())
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Data loading completed successfully',
+                          'keys_loaded': keys_loaded,
+                          'final_db_size': final_count,
+                          'redis_endpoint': redis_endpoint
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+
+Outputs:
+  DataLoaderFunctionName:
+    Description: Name of the data loader Lambda function
+    Value: !Ref DataLoaderFunction
+    
+  DataLoaderFunctionArn:
+    Description: ARN of the data loader Lambda function
+    Value: !GetAtt DataLoaderFunction.Arn

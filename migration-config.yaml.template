@@ -1,0 +1,90 @@
+# ElastiCache Redis Cross-Account Migration Configuration Template
+# Copy this file to migration-config.yaml and update with your specific values
+
+migration:
+  # Source account configuration
+  source:
+    profile: "source-profile"  # AWS CLI profile name for source account
+    region: "us-east-1"
+    account_id: "<source-account-id>"  # 12-digit AWS account ID
+    
+    # Source infrastructure (from step 1)
+    infrastructure_stack_name: "elasticache-source-stack"
+    
+    # Migration setup stack (from step 3a)
+    migration_setup_stack_name: "source-migration-setup"
+    
+    # ElastiCache cluster details (actual deployed cluster)
+    cluster_id: "<source-cluster-id>"
+    
+  # Target account configuration  
+  target:
+    profile: "target-profile"  # AWS CLI profile name for target account
+    region: "us-east-1"  # Must match source region
+    account_id: "<target-account-id>"  # 12-digit AWS account ID
+    
+    # Target infrastructure (from step 2)
+    infrastructure_stack_name: "elasticache-target-stack"
+    
+    # Migration setup stack (from step 3b)
+    migration_setup_stack_name: "target-migration-setup"
+    
+    # Target cluster configuration
+    cluster:
+      node_type: "cache.r7g.large"  # Should match or exceed source
+      parameter_group: "default.redis7"
+      
+  # Migration options
+  options:
+    # Snapshot settings
+    snapshot:
+      create_new: true  # Create new snapshot or use existing
+      existing_snapshot_name: ""  # If create_new is false
+      retention_days: 7  # How long to keep the snapshot
+      
+    # Export settings
+    export:
+      wait_timeout_minutes: 30
+      
+    # Import settings
+    import:
+      wait_timeout_minutes: 60
+      verify_data: true
+      
+    # Cleanup settings
+    cleanup:
+      delete_source_snapshot: false
+      delete_s3_exports: false
+      delete_migration_stacks: false
+
+# Validation settings
+validation:
+  # Deploy validation infrastructure
+  deploy_validation: true
+  
+  # Validation type: lambda or ec2
+  validation_type: "lambda"
+  
+  # Expected data (for validation)
+  expected:
+    min_keys: 1
+    key_patterns:
+      - "products:all"
+      - "product:*"
+    
+# Advanced settings
+advanced:
+  # Logging
+  log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  log_file: "migration.log"
+  
+  # Timeouts
+  timeouts:
+    snapshot_creation: 1800  # 30 minutes
+    export_completion: 3600  # 1 hour
+    import_completion: 3600  # 1 hour
+    
+  # Retry settings
+  retry:
+    max_attempts: 3
+    delay_seconds: 30

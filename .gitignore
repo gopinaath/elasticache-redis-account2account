@@ -1,0 +1,27 @@
+# Configuration files with sensitive data
+migration-config.yaml
+
+# Log files
+*.log
+migration.log
+
+# AWS CLI output files
+response.json
+
+# Temporary files
+*.tmp
+*.temp
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.bak
+*.backup

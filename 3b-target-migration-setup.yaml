@@ -1,0 +1,207 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Simplified Migration Setup for Target Account - S3 and IAM Resources'
+
+Parameters:
+  SourceAccountId:
+    Description: AWS Account ID of the source account
+    Type: String
+    AllowedPattern: '[0-9]{12}'
+    ConstraintDescription: Must be a valid 12-digit AWS Account ID
+    
+  BucketPrefix:
+    Description: Prefix for S3 bucket name
+    Type: String
+    Default: elasticache-import
+
+Resources:
+  # S3 Bucket for ElastiCache imports
+  ImportBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${BucketPrefix}-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false  # Required for ElastiCache canonical user ACLs
+        IgnorePublicAcls: false
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldImports
+            Status: Enabled
+            ExpirationInDays: 30
+            NoncurrentVersionExpirationInDays: 7
+      Tags:
+        - Key: Purpose
+          Value: ElastiCache-Migration
+        - Key: MigrationRole
+          Value: Target
+
+  # Bucket policy to allow source account access
+  ImportBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ImportBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSourceAccountWrite
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${SourceAccountId}:root'
+            Action:
+              - s3:PutObject
+              - s3:PutObjectAcl
+              - s3:ListBucket
+              - s3:GetBucketLocation
+            Resource:
+              - !GetAtt ImportBucket.Arn
+              - !Sub '${ImportBucket.Arn}/*'
+
+  # Simple Lambda function to set bucket ACL (no validation needed)
+  SetBucketACLFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-set-bucket-acl'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ACLManagementRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # ElastiCache canonical user ID (same for all regions)
+          ELASTICACHE_CANONICAL_ID = "540804c33a284a299d2547575ce1010f2312ef3da9b3a053c8bc45bf233e4353"
+
+          def lambda_handler(event, context):
+              try:
+                  logger.info(f"Request type: {event['RequestType']}")
+                  
+                  if event['RequestType'] == 'Delete':
+                      logger.info("Delete request - no action needed")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  s3 = boto3.client('s3')
+                  bucket_name = event['ResourceProperties']['BucketName']
+                  
+                  logger.info(f"Setting ACL for bucket: {bucket_name}")
+                  
+                  # Get current bucket owner
+                  response = s3.get_bucket_acl(Bucket=bucket_name)
+                  owner_id = response['Owner']['ID']
+                  
+                  # Set bucket ACL with ElastiCache canonical user permissions
+                  s3.put_bucket_acl(
+                      Bucket=bucket_name,
+                      GrantFullControl=f'id={owner_id}',
+                      GrantRead=f'id={ELASTICACHE_CANONICAL_ID}',
+                      GrantWrite=f'id={ELASTICACHE_CANONICAL_ID}',
+                      GrantReadACP=f'id={ELASTICACHE_CANONICAL_ID}'
+                  )
+                  
+                  logger.info("Bucket ACL set successfully")
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'BucketName': bucket_name,
+                      'CanonicalUserId': ELASTICACHE_CANONICAL_ID,
+                      'Status': 'SUCCESS'
+                  })
+                  
+              except Exception as e:
+                  error_msg = f"Error setting bucket ACL: {str(e)}"
+                  logger.error(error_msg)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {
+                      'Error': error_msg
+                  })
+
+  # IAM role for Lambda function
+  ACLManagementRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3ACLManagement
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketAcl
+                  - s3:PutBucketAcl
+                  - s3:GetObjectAcl
+                  - s3:PutObjectAcl
+                Resource:
+                  - !GetAtt ImportBucket.Arn
+                  - !Sub '${ImportBucket.Arn}/*'
+
+  # Custom resource to set bucket ACL
+  SetBucketACL:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt SetBucketACLFunction.Arn
+      BucketName: !Ref ImportBucket
+
+Outputs:
+  ImportBucketName:
+    Description: Name of the S3 bucket for ElastiCache imports
+    Value: !Ref ImportBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ImportBucket'
+
+  ImportBucketArn:
+    Description: ARN of the import bucket
+    Value: !GetAtt ImportBucket.Arn
+
+  ElastiCacheCanonicalUserId:
+    Description: ElastiCache canonical user ID (same for all regions)
+    Value: "540804c33a284a299d2547575ce1010f2312ef3da9b3a053c8bc45bf233e4353"
+
+  BucketACLStatus:
+    Description: Status of import bucket ACL configuration
+    Value: !GetAtt SetBucketACL.Status
+
+  ImportInstructions:
+    Description: Instructions for importing ElastiCache RDB files
+    Value: !Sub |
+      To import RDB files to this bucket:
+      
+      1. Copy RDB file from source bucket:
+      aws s3 cp s3://source-bucket/your-file.rdb s3://${ImportBucket}/
+      
+      2. Create Redis cluster with RDB import:
+      aws elasticache create-cache-cluster --cache-cluster-id your-cluster \
+        --engine redis --cache-node-type cache.r7g.large \
+        --cache-subnet-group-name your-subnet-group \
+        --security-group-ids your-security-group \
+        --snapshot-arns arn:aws:s3:::${ImportBucket}/your-file.rdb
+
+  ManualBucketACLCommand:
+    Description: Manual command to set bucket ACL if needed
+    Value: !Sub |
+      aws s3api put-bucket-acl --bucket ${ImportBucket} \
+        --grant-full-control id=YOUR_ACCOUNT_CANONICAL_ID \
+        --grant-read id=540804c33a284a299d2547575ce1010f2312ef3da9b3a053c8bc45bf233e4353 \
+        --grant-write id=540804c33a284a299d2547575ce1010f2312ef3da9b3a053c8bc45bf233e4353 \
+        --grant-read-acp id=540804c33a284a299d2547575ce1010f2312ef3da9b3a053c8bc45bf233e4353

@@ -1,0 +1,622 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ElastiCache Redis Source Infrastructure - Persistence Enabled'
+
+Parameters:
+  # Instance Configuration
+  RedisNodeType:
+    Description: ElastiCache node type (must support persistence for reliable migration)
+    Type: String
+    Default: cache.r7g.large
+    AllowedValues:
+      - cache.t3.micro  # No persistence - for testing only
+      - cache.r7g.large
+      - cache.r7g.xlarge
+      - cache.r6g.large
+      - cache.m7g.large
+      - cache.m6g.large
+    ConstraintDescription: Select an instance type. Note that t3.micro does not support persistence.
+    
+  EnablePersistence:
+    Description: Enable Redis persistence features (recommended for migration)
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+      
+  SnapshotRetentionDays:
+    Description: Number of days to retain automatic backups (0 to disable)
+    Type: Number
+    Default: 7
+    MinValue: 0
+    MaxValue: 35
+    
+  # Network Configuration
+  VPCCidr:
+    Description: CIDR block for VPC
+    Type: String
+    Default: 10.0.0.0/16
+    
+  # Application Configuration
+  EnableDemoApp:
+    Description: Deploy demo web application for testing
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+      
+  KeyPairName:
+    Description: EC2 Key Pair for SSH access (required if EnableDemoApp is true)
+    Type: String
+    Default: ''
+    
+  AllowedIP:
+    Description: Your IP address for web/SSH access (x.x.x.x/32)
+    Type: String
+    Default: 0.0.0.0/0
+    ConstraintDescription: Must be a valid CIDR range
+    
+  DBPassword:
+    Description: Password for demo PostgreSQL database
+    Type: String
+    Default: 'DemoPassword123!'
+    NoEcho: true
+    MinLength: 8
+
+Conditions:
+  DeployDemoApp: !Equals [!Ref EnableDemoApp, 'true']
+  EnableBackups: !Not [!Equals [!Ref SnapshotRetentionDays, 0]]
+  HasKeyPair: !Not [!Equals [!Ref KeyPairName, '']]
+  IsPersistenceEnabled: !Equals [!Ref EnablePersistence, 'true']
+
+Resources:
+  # VPC Configuration
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VPCCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-VPC'
+        - Key: Purpose
+          Value: ElastiCache-Migration-Source
+
+  # Internet Gateway (for demo app)
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Condition: DeployDemoApp
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-IGW'
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: DeployDemoApp
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Public Subnet (for demo app)
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Condition: DeployDemoApp
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [0, !Cidr [!Ref VPCCidr, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-PublicSubnet'
+
+  # Private Subnets for Redis
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [1, !Cidr [!Ref VPCCidr, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-PrivateSubnet1'
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [2, !Cidr [!Ref VPCCidr, 4, 8]]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-PrivateSubnet2'
+
+  # Route Table for public subnet
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: DeployDemoApp
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-PublicRT'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Condition: DeployDemoApp
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: DeployDemoApp
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # Security Groups
+  RedisSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-Redis-SG'
+      GroupDescription: Security group for ElastiCache Redis
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Redis-SG'
+
+  RedisSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RedisSecurityGroup
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      SourceSecurityGroupId: !Ref RedisSecurityGroup
+      Description: Allow Redis access within security group
+
+  # Demo App Security Group
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: DeployDemoApp
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-WebServer-SG'
+      GroupDescription: Security group for demo web server
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedIP
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: !Ref AllowedIP
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-WebServer-SG'
+
+  # Allow web server to access Redis
+  RedisFromWebIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: DeployDemoApp
+    Properties:
+      GroupId: !Ref RedisSecurityGroup
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      SourceSecurityGroupId: !Ref WebServerSecurityGroup
+      Description: Allow Redis access from web server
+
+  # Database Security Group (for demo)
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: DeployDemoApp
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-Database-SG'
+      GroupDescription: Security group for RDS PostgreSQL
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref WebServerSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Database-SG'
+
+  # ElastiCache Subnet Group
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      CacheSubnetGroupName: !Sub '${AWS::StackName}-cache-subnet-group'
+      Description: Subnet group for ElastiCache
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  # ElastiCache Parameter Group (for persistence settings)
+  CacheParameterGroup:
+    Type: AWS::ElastiCache::ParameterGroup
+    Condition: IsPersistenceEnabled
+    Properties:
+      CacheParameterGroupFamily: redis7
+      Description: !Sub '${AWS::StackName} Redis parameter group with persistence'
+
+  # ElastiCache Redis Cluster
+  RedisCluster:
+    Type: AWS::ElastiCache::CacheCluster
+    Properties:
+      ClusterName: !Sub '${AWS::StackName}-redis'
+      Engine: redis
+      EngineVersion: '7.1'
+      CacheNodeType: !Ref RedisNodeType
+      NumCacheNodes: 1
+      CacheParameterGroupName: !If 
+        - IsPersistenceEnabled
+        - !Ref CacheParameterGroup
+        - !Ref AWS::NoValue
+      VpcSecurityGroupIds:
+        - !Ref RedisSecurityGroup
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      SnapshotRetentionLimit: !If
+        - EnableBackups
+        - !Ref SnapshotRetentionDays
+        - !Ref AWS::NoValue
+      PreferredMaintenanceWindow: !If
+        - EnableBackups
+        - 'sun:05:00-sun:06:00'
+        - !Ref AWS::NoValue
+      SnapshotWindow: !If
+        - EnableBackups
+        - '03:00-04:00'
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Redis'
+        - Key: PersistenceEnabled
+          Value: !Ref EnablePersistence
+        - Key: MigrationRole
+          Value: Source
+
+  # RDS Subnet Group (for demo)
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Condition: DeployDemoApp
+    Properties:
+      DBSubnetGroupName: !Sub '${AWS::StackName}-db-subnet-group'
+      DBSubnetGroupDescription: Subnet group for RDS
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-DBSubnetGroup'
+
+  # PostgreSQL RDS Instance (for demo)
+  PostgreSQLDatabase:
+    Type: AWS::RDS::DBInstance
+    Condition: DeployDemoApp
+    Properties:
+      DBInstanceIdentifier: !Sub '${AWS::StackName}-postgres'
+      DBInstanceClass: db.t3.micro
+      Engine: postgres
+      EngineVersion: '15.7'
+      MasterUsername: dbadmin
+      MasterUserPassword: !Ref DBPassword
+      AllocatedStorage: 20
+      StorageType: gp3
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      BackupRetentionPeriod: 0
+      MultiAZ: false
+      PubliclyAccessible: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-PostgreSQL'
+
+  # IAM Role for Demo EC2
+  EC2Role:
+    Type: AWS::IAM::Role
+    Condition: DeployDemoApp
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ElastiCacheAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'elasticache:Describe*'
+                  - 'elasticache:List*'
+                Resource: '*'
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Condition: DeployDemoApp
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-EC2-Profile'
+      Roles:
+        - !Ref EC2Role
+
+  # Demo Web Server
+  WebServer:
+    Type: AWS::EC2::Instance
+    Condition: DeployDemoApp
+    DependsOn:
+      - PostgreSQLDatabase
+      - RedisCluster
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64}}'
+      InstanceType: t3.small
+      KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref AWS::NoValue]
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SecurityGroupIds:
+        - !Ref WebServerSecurityGroup
+      SubnetId: !Ref PublicSubnet
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          
+          # Install dependencies
+          yum update -y
+          dnf install -y git postgresql15 gcc-c++ make redis6
+          curl -sL https://rpm.nodesource.com/setup_18.x | bash -
+          yum install -y nodejs
+          
+          # Create demo app
+          mkdir -p /home/ec2-user/app
+          cd /home/ec2-user/app
+          
+          cat > package.json << 'EOF'
+          {
+            "name": "elasticache-demo",
+            "version": "1.0.0",
+            "dependencies": {
+              "express": "^4.18.2",
+              "redis": "^4.6.5",
+              "pg": "^8.10.0"
+            }
+          }
+          EOF
+          
+          npm install
+          
+          # Create application
+          cat > app.js << 'EOF'
+          const express = require('express');
+          const { createClient } = require('redis');
+          const { Pool } = require('pg');
+          
+          const app = express();
+          const port = 3000;
+          
+          // PostgreSQL connection
+          const pool = new Pool({
+            host: '${PostgreSQLDatabase.Endpoint.Address}',
+            port: 5432,
+            database: 'postgres',
+            user: 'dbadmin',
+            password: '${DBPassword}',
+            ssl: { rejectUnauthorized: false }
+          });
+          
+          // Redis connection
+          const redis = createClient({
+            socket: {
+              host: '${RedisCluster.RedisEndpoint.Address}',
+              port: 6379
+            }
+          });
+          
+          redis.on('error', err => console.log('Redis Client Error', err));
+          redis.connect();
+          
+          // Initialize database
+          async function initDB() {
+            try {
+              await pool.query(`
+                CREATE TABLE IF NOT EXISTS products (
+                  id SERIAL PRIMARY KEY,
+                  name VARCHAR(100),
+                  price DECIMAL(10,2),
+                  description TEXT,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+              `);
+              
+              const result = await pool.query('SELECT COUNT(*) FROM products');
+              if (result.rows[0].count == 0) {
+                await pool.query(`
+                  INSERT INTO products (name, price, description) VALUES
+                  ('Laptop', 999.99, 'High-performance laptop'),
+                  ('Mouse', 29.99, 'Wireless mouse'),
+                  ('Keyboard', 79.99, 'Mechanical keyboard'),
+                  ('Monitor', 299.99, '27-inch 4K monitor'),
+                  ('Headphones', 149.99, 'Noise-cancelling headphones')
+                `);
+              }
+            } catch (err) {
+              console.error('Database initialization error:', err);
+            }
+          }
+          
+          initDB();
+          
+          // Middleware
+          app.use(express.json());
+          
+          // Cache statistics
+          let cacheHits = 0;
+          let cacheMisses = 0;
+          
+          // Get all products with caching
+          app.get('/products', async (req, res) => {
+            try {
+              const cachedData = await redis.get('products:all');
+              
+              if (cachedData) {
+                cacheHits++;
+                return res.json({
+                  source: 'cache',
+                  data: JSON.parse(cachedData),
+                  stats: { hits: cacheHits, misses: cacheMisses }
+                });
+              }
+              
+              cacheMisses++;
+              const result = await pool.query('SELECT * FROM products ORDER BY id');
+              const products = result.rows;
+              
+              // Store in cache
+              await redis.set('products:all', JSON.stringify(products));
+              
+              // Store individual products
+              for (const product of products) {
+                await redis.set('product:' + product.id, JSON.stringify(product));
+              }
+              
+              res.json({
+                source: 'database',
+                data: products,
+                stats: { hits: cacheHits, misses: cacheMisses }
+              });
+              
+            } catch (err) {
+              res.status(500).json({ error: err.message });
+            }
+          });
+          
+          // Health check
+          app.get('/health', async (req, res) => {
+            try {
+              await pool.query('SELECT 1');
+              await redis.ping();
+              res.json({ 
+                status: 'healthy',
+                database: 'connected',
+                cache: 'connected',
+                stats: { hits: cacheHits, misses: cacheMisses }
+              });
+            } catch (err) {
+              res.status(500).json({ status: 'unhealthy', error: err.message });
+            }
+          });
+          
+          // Redis info
+          app.get('/redis-info', async (req, res) => {
+            try {
+              const dbSize = await redis.dbSize();
+              const keys = await redis.keys('*');
+              res.json({ dbSize, keys });
+            } catch (err) {
+              res.status(500).json({ error: err.message });
+            }
+          });
+          
+          app.listen(port, () => {
+            console.log('Server running on port ' + port);
+          });
+          EOF
+          
+          # Set permissions
+          chown -R ec2-user:ec2-user /home/ec2-user/app
+          
+          # Create systemd service
+          cat > /etc/systemd/system/webapp.service << 'EOF'
+          [Unit]
+          Description=ElastiCache Demo Web App
+          After=network.target
+          
+          [Service]
+          Type=simple
+          User=ec2-user
+          WorkingDirectory=/home/ec2-user/app
+          ExecStart=/usr/bin/node /home/ec2-user/app/app.js
+          Restart=always
+          
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          
+          systemctl daemon-reload
+          systemctl enable webapp
+          systemctl start webapp
+          
+          # Warm cache after startup
+          sleep 10
+          curl -s http://localhost:3000/products > /dev/null
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-WebServer'
+
+Outputs:
+  RedisEndpoint:
+    Description: Redis cluster endpoint
+    Value: !GetAtt RedisCluster.RedisEndpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-Redis-Endpoint'
+      
+  RedisPort:
+    Description: Redis port
+    Value: !GetAtt RedisCluster.RedisEndpoint.Port
+    Export:
+      Name: !Sub '${AWS::StackName}-Redis-Port'
+      
+  RedisClusterId:
+    Description: Redis cluster ID
+    Value: !Ref RedisCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-Redis-ClusterId'
+      
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPC-ID'
+      
+  SecurityGroupId:
+    Description: Redis security group ID
+    Value: !Ref RedisSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-Redis-SG'
+      
+  SubnetIds:
+    Description: Private subnet IDs for Redis
+    Value: !Join [',', [!Ref PrivateSubnet1, !Ref PrivateSubnet2]]
+    Export:
+      Name: !Sub '${AWS::StackName}-Subnet-IDs'
+      
+  WebsiteURL:
+    Description: Demo application URL
+    Condition: DeployDemoApp
+    Value: !Sub 'http://${WebServer.PublicIp}:3000'
+    
+  PersistenceEnabled:
+    Description: Is persistence enabled
+    Value: !Ref EnablePersistence
+    
+  NodeType:
+    Description: Redis node type
+    Value: !Ref RedisNodeType

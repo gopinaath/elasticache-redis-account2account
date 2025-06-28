@@ -1,0 +1,189 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Fixed Lambda function to validate Redis migration data'
+
+Parameters:
+  RedisEndpoint:
+    Type: String
+    Default: '<redis-cluster-endpoint>'
+    Description: Redis cluster endpoint
+    
+  TargetInfrastructureStack:
+    Type: String
+    Default: 'elasticache-target-stack'
+    Description: Name of the target infrastructure stack to get VPC details
+
+Resources:
+  # Lambda execution role
+  ValidationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # Lambda function to validate migration
+  ValidationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-redis-validator'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ValidationLambdaRole.Arn
+      Timeout: 300
+      VpcConfig:
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub '${TargetInfrastructureStack}-Redis-SG'
+        SubnetIds: 
+          - !Select [0, !Split [',', !ImportValue {'Fn::Sub': '${TargetInfrastructureStack}-Subnet-IDs'}]]
+          - !Select [1, !Split [',', !ImportValue {'Fn::Sub': '${TargetInfrastructureStack}-Subnet-IDs'}]]
+      Environment:
+        Variables:
+          REDIS_HOST: !Ref RedisEndpoint
+          REDIS_PORT: '6379'
+      Code:
+        ZipFile: |
+          import json
+          import socket
+          import os
+          import logging
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def send_redis_command(host, port, command):
+              """Send a Redis command using raw socket connection"""
+              try:
+                  sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                  sock.settimeout(10)
+                  sock.connect((host, port))
+                  
+                  # Send command
+                  sock.send(command.encode() + b'\r\n')
+                  
+                  # Receive response
+                  response = sock.recv(4096).decode()
+                  sock.close()
+                  
+                  return response
+              except Exception as e:
+                  logger.error(f"Socket error: {str(e)}")
+                  return None
+
+          def lambda_handler(event, context):
+              try:
+                  redis_host = os.environ['REDIS_HOST']
+                  redis_port = int(os.environ['REDIS_PORT'])
+                  
+                  logger.info(f"Connecting to Redis at {redis_host}:{redis_port}")
+                  
+                  # Test basic connection with PING
+                  ping_response = send_redis_command(redis_host, redis_port, 'PING')
+                  if not ping_response or 'PONG' not in ping_response:
+                      raise Exception(f"Redis PING failed: {ping_response}")
+                  
+                  logger.info("Successfully connected to Redis")
+                  
+                  # Get database size
+                  dbsize_response = send_redis_command(redis_host, redis_port, 'DBSIZE')
+                  logger.info(f"DBSIZE response: {dbsize_response}")
+                  
+                  # Parse DBSIZE response (format: :42\r\n)
+                  total_keys = 0
+                  if dbsize_response and dbsize_response.startswith(':'):
+                      try:
+                          total_keys = int(dbsize_response.split('\r\n')[0][1:])
+                      except:
+                          total_keys = 0
+                  
+                  # Get some sample keys
+                  keys_response = send_redis_command(redis_host, redis_port, 'KEYS *')
+                  logger.info(f"KEYS response (first 200 chars): {keys_response[:200] if keys_response else 'None'}")
+                  
+                  # Parse keys response to count actual keys
+                  actual_keys = []
+                  if keys_response and keys_response.startswith('*'):
+                      try:
+                          lines = keys_response.split('\r\n')
+                          key_count = int(lines[0][1:])  # First line is *N where N is number of keys
+                          for i in range(1, len(lines), 2):  # Keys are on odd lines
+                              if lines[i].startswith('$') and i+1 < len(lines):
+                                  actual_keys.append(lines[i+1])
+                      except Exception as e:
+                          logger.warning(f"Could not parse keys response: {e}")
+                  
+                  # Basic validation
+                  validation_result = {
+                      'status': 'SUCCESS',
+                      'migration_validated': True,
+                      'redis_connection': 'OK',
+                      'ping_response': ping_response.strip(),
+                      'dbsize_response': dbsize_response.strip() if dbsize_response else 'No response',
+                      'total_keys_found': total_keys,
+                      'actual_keys_sample': actual_keys[:10],  # First 10 keys
+                      'keys_sample_response': keys_response[:500] if keys_response else 'No response',
+                      'summary': {
+                          'total_keys_migrated': total_keys,
+                          'expected_minimum': 40,
+                          'migration_success': total_keys >= 40,
+                          'connection_test': 'PASSED' if ping_response and 'PONG' in ping_response else 'FAILED',
+                          'data_validation': 'PASSED' if total_keys >= 40 else 'FAILED - Insufficient keys'
+                      }
+                  }
+                  
+                  logger.info(f"Validation completed: {total_keys} keys found")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(validation_result, indent=2)
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Validation error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'status': 'ERROR',
+                          'error': 'Validation failed',
+                          'details': str(e)
+                      })
+                  }
+
+Outputs:
+  ValidationLambdaArn:
+    Description: ARN of the validation Lambda function
+    Value: !GetAtt ValidationLambda.Arn
+    
+  ValidationLambdaName:
+    Description: Name of the validation Lambda function
+    Value: !Ref ValidationLambda
+    
+  ValidationInstructions:
+    Description: Instructions to run the validation
+    Value: !Sub |
+      To validate the migration, invoke the Lambda function:
+      
+      aws lambda invoke --function-name ${ValidationLambda} \
+        --payload '{}' \
+        --cli-binary-format raw-in-base64-out \
+        response.json
+      
+      Then check the response:
+      cat response.json

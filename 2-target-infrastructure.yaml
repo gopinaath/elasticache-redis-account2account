@@ -1,0 +1,342 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ElastiCache Redis Target Infrastructure - VPC and Supporting Resources for Migration'
+
+Parameters:
+  # Network Configuration
+  VPCCidr:
+    Description: CIDR block for VPC (should be different from source)
+    Type: String
+    Default: 10.1.0.0/16
+    
+  # Application Configuration
+  EnableDemoApp:
+    Description: Deploy demo web application for testing
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+      
+  KeyPairName:
+    Description: EC2 Key Pair for SSH access (required if EnableDemoApp is true)
+    Type: String
+    Default: ''
+
+Conditions:
+  DeployDemoApp: !Equals [!Ref EnableDemoApp, 'true']
+  HasKeyPair: !Not [!Equals [!Ref KeyPairName, '']]
+
+Resources:
+  # VPC and Networking
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VPCCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-VPC'
+        - Key: Purpose
+          Value: ElastiCache-Migration-Target
+
+  # Internet Gateway for demo app
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Condition: DeployDemoApp
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-IGW'
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: DeployDemoApp
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Private Subnets for ElastiCache
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [0, !Cidr [!Ref VPCCidr, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Private-Subnet-1'
+        - Key: Type
+          Value: Private
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [1, !Cidr [!Ref VPCCidr, 4, 8]]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Private-Subnet-2'
+        - Key: Type
+          Value: Private
+
+  # Public Subnet for demo app
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Condition: DeployDemoApp
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [2, !Cidr [!Ref VPCCidr, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Public-Subnet'
+        - Key: Type
+          Value: Public
+
+  # Route Tables
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Private-RT'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: DeployDemoApp
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Public-RT'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Condition: DeployDemoApp
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # Subnet Associations
+  PrivateSubnetAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  PublicSubnetAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: DeployDemoApp
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # Security Groups
+  RedisSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-Redis-SG'
+      GroupDescription: Security group for ElastiCache Redis clusters
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Redis-SG'
+        - Key: Purpose
+          Value: Redis-Access-Control
+
+  # Self-referencing rule for Redis
+  RedisSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RedisSecurityGroup
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      SourceSecurityGroupId: !Ref RedisSecurityGroup
+      Description: Allow Redis access within security group
+
+  # Demo App Security Group
+  DemoAppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: DeployDemoApp
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-DemoApp-SG'
+      GroupDescription: Security group for demo application
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP access
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH access
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-DemoApp-SG'
+
+  # ElastiCache Subnet Group (for future Redis clusters)
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      CacheSubnetGroupName: !Sub '${AWS::StackName}-cache-subnet-group'
+      Description: Subnet group for ElastiCache Redis clusters
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  # Demo Application (EC2 Instance)
+  DemoAppRole:
+    Type: AWS::IAM::Role
+    Condition: DeployDemoApp
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  DemoAppInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Condition: DeployDemoApp
+    Properties:
+      Roles:
+        - !Ref DemoAppRole
+
+  DemoAppInstance:
+    Type: AWS::EC2::Instance
+    Condition: DeployDemoApp
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64}}'  # Latest Amazon Linux 2023
+      InstanceType: t3.micro
+      KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref 'AWS::NoValue']
+      IamInstanceProfile: !Ref DemoAppInstanceProfile
+      SecurityGroupIds:
+        - !Ref DemoAppSecurityGroup
+        - !Ref RedisSecurityGroup
+      SubnetId: !Ref PublicSubnet
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y python3 python3-pip redis
+          pip3 install flask redis boto3
+          
+          # Create placeholder web app
+          cat > /home/ec2-user/app.py << 'EOF'
+          from flask import Flask, render_template_string
+          import redis
+          
+          app = Flask(__name__)
+          
+          @app.route('/')
+          def home():
+              return render_template_string('''
+              <h1>ElastiCache Redis Target Environment</h1>
+              <h2>Ready for Migration</h2>
+              <p>This environment is prepared to receive migrated Redis clusters.</p>
+              <p>Available resources:</p>
+              <ul>
+                <li>VPC: ${VPCCidr}</li>
+                <li>Subnets: Private subnets for Redis</li>
+                <li>Security Groups: Redis access controls configured</li>
+                <li>Cache Subnet Group: Ready for ElastiCache deployment</li>
+              </ul>
+              <p>To connect to a Redis cluster, use the security group: ${RedisSecurityGroup}</p>
+              ''')
+          
+          if __name__ == '__main__':
+              app.run(host='0.0.0.0', port=80)
+          EOF
+          
+          # Start the app
+          cd /home/ec2-user
+          python3 app.py &
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-DemoApp'
+
+Outputs:
+  VPCId:
+    Description: VPC ID for target environment
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPC-ID'
+
+  SubnetIds:
+    Description: Private subnet IDs for ElastiCache deployment
+    Value: !Sub '${PrivateSubnet1},${PrivateSubnet2}'
+    Export:
+      Name: !Sub '${AWS::StackName}-Subnet-IDs'
+
+  SecurityGroupId:
+    Description: Redis security group ID
+    Value: !Ref RedisSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-Redis-SG'
+
+  CacheSubnetGroupName:
+    Description: ElastiCache subnet group name
+    Value: !Ref CacheSubnetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-CacheSubnetGroup'
+
+  VPCCidr:
+    Description: VPC CIDR block
+    Value: !Ref VPCCidr
+
+  AvailabilityZones:
+    Description: Availability zones used
+    Value: !Sub 
+      - '${AZ1}, ${AZ2}'
+      - AZ1: !GetAtt PrivateSubnet1.AvailabilityZone
+        AZ2: !GetAtt PrivateSubnet2.AvailabilityZone
+
+  DemoAppURL:
+    Description: Demo application URL
+    Value: !If 
+      - DeployDemoApp
+      - !Sub 'http://${DemoAppInstance.PublicIp}'
+      - 'Demo app not deployed'
+    Condition: DeployDemoApp
+
+  DemoAppSSH:
+    Description: SSH command for demo app
+    Value: !If 
+      - DeployDemoApp
+      - !Sub 'ssh -i ${KeyPairName}.pem ec2-user@${DemoAppInstance.PublicIp}'
+      - 'Demo app not deployed'
+    Condition: DeployDemoApp
+
+  DeploymentInstructions:
+    Description: Instructions for deploying Redis clusters
+    Value: !Sub |
+      To deploy a Redis cluster in this environment, use:
+      
+      aws elasticache create-cache-cluster \
+        --cache-cluster-id your-cluster-name \
+        --engine redis \
+        --cache-node-type cache.r7g.large \
+        --num-cache-nodes 1 \
+        --cache-subnet-group-name ${CacheSubnetGroup} \
+        --security-group-ids ${RedisSecurityGroup} \
+        --snapshot-arns arn:aws:s3:::your-bucket/your-file.rdb
