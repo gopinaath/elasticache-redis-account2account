@@ -221,5 +221,4 @@ Happy migrating! 🚀
 
 ---
 
-**Created with ❤️ by Gopinaath**  
 **GitHub**: [github.com/gopinaath/elasticache-redis-account2account](https://github.com/gopinaath/elasticache-redis-account2account)
